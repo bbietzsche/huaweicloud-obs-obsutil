@@ -17,7 +17,7 @@ import (
     "command/i18n"
     "concurrent"
     "fmt"
-    "obs"        // Varsayım: OBS ile ilişkili paket 
+    "obs"      
     "progress"
     "sync"
     "sync/atomic"
@@ -26,83 +26,80 @@ import (
     "path/filepath"
     "os"
     "errors"
-    // Burada, gerçek bir unzip işlemi için "archive/zip" gibi paketler de eklenebilir
+    // For real unzip functionality, you might import "archive/zip" or other relevant packages
 )
 
 // --------------------------- unzipCommand struct -----------------------------
 
 type unzipCommand struct {
-    transferCommand
+    transferCommand       // similar embedded struct for shared fields/methods
     recursive bool
     force     bool
     dryRun    bool
     flat      bool
     jobs      int
     parallel  int
-    // ... vs. buradaki flag'ler init() içinde define edilecek
+    // Additional flags can be added as needed
 }
 
-// Tek bir “zip” dosyası veya “çoklu zip” dosyaları için parametre
+// unzipRequestInput encapsulates the source and destination for a single unzip operation
 type unzipRequestInput struct {
-    srcLocalPath   string // yerel .zip dosyası
-    dstLocalPath   string // açılacak hedef klasör
-    needSubfolders bool   // alt klasörleri koru / koruma
-    canOverwrite   bool   // hedefte var ise üzerine yaz
+    srcLocalPath   string // .zip file or local path
+    dstLocalPath   string // target extraction directory
+    keepSubfolders bool   // preserve subfolders if true
+    canOverwrite   bool   // overwrite existing files if true
 }
 
-// Sıralı veya paralel "unzip" görevleri
+// unzipScanCtx is used for scanning directories or tasks
 type unzipScanCtx struct {
-    input        unzipRequestInput
-    pool         concurrent.Pool
-    barCh        progress.SingleBarChan
-    actionName   string
-    action       func(req unzipRequestInput, barCh progress.SingleBarChan, fastError error) int
+    input      unzipRequestInput
+    pool       concurrent.Pool
+    barCh      progress.SingleBarChan
+    actionName string
+    action     func(req unzipRequestInput, barCh progress.SingleBarChan, fastError error) int
 }
 
 // ---------------------------------------------------------------------------
-// ------------------------ Metotlar ve Yardımcı Fonksiyonlar -----------------
+// ---------------------- Helper and Processing Functions ---------------------
 
-// (Örnek) localUnzipFile: gerçekte arşiv/zip vb. paketlere ihtiyaç duyar
+// localUnzipFile simulates or performs the actual unzip.
+// Real code would use "archive/zip" or an equivalent library.
 func (c *unzipCommand) localUnzipFile(req unzipRequestInput) error {
-    // Burada gerçekten unzip yapmak için "archive/zip" vb. kullanılabilir.
-    // Sadece örnek hata / info mesajları gösteriyoruz.
-    doLog(LEVEL_INFO, "Start unzipping source [%s] to destination [%s]", req.srcLocalPath, req.dstLocalPath)
-    
-    // Sözde kontrol: eğer dryRun ise, fiziksel işlemleri atla
+    doLog(LEVEL_INFO, "Starting unzip from source [%s] to destination [%s]", req.srcLocalPath, req.dstLocalPath)
+
+    // If dryRun is set, we skip the actual file operations
     if c.dryRun {
-        // Sadece simülasyon
         return nil
     }
 
-    // Örnek: exist check (gerçek kodda isDir vs. handle edilir)
+    // Basic existence check
     if _, err := os.Stat(req.srcLocalPath); os.IsNotExist(err) {
         return fmt.Errorf("zip file [%s] not found", req.srcLocalPath)
     }
-    // Varsayalım unzip başarılı
-    doLog(LEVEL_INFO, "Unzip file done successfully. src: %s, dst: %s", req.srcLocalPath, req.dstLocalPath)
+    // Here, you would do real unzip logic (e.g. archive/zip).
+    // We'll just log success for demonstration.
+    doLog(LEVEL_INFO, "Successfully unzipped file. source: %s, destination: %s", req.srcLocalPath, req.dstLocalPath)
     return nil
 }
 
-// Move / Copy / Rename yapısına benzer şekilde, “unzip” edilecek dosyaları
-// taramak ve action() fonksiyonuna göndermek
-func (c *unzipCommand) scanZipDirAndDoAction(ctx unzipScanCtx) (totalCount int64, hasListError error) {
+
+// It traverses a local path, finds .zip files, and schedules them for extraction.
+func (c *unzipCommand) scanZipDirAndDoAction(ctx unzipScanCtx) (totalCount int64, listError error) {
     defer func() {
         if atomic.LoadInt32(&c.abort) == 1 {
-            doLog(LEVEL_ERROR, "Abort scanning due to an unexpected error. Check logs.")
+            doLog(LEVEL_ERROR, "Aborting scan due to an unexpected error. Please check logs.")
         }
     }()
 
-    // Simülasyon: Sanki bir klasör veya prefix listeliyoruz
-    // Elde ettiğimiz zip dosyalarını ctx.action'a yolluyoruz
-
-    // Bu örnekte yerel dosya system'inde tarama yapalım.
-    // (Gerçek OBS taraması, “ListObjects” vb. ile benzer yapıda olurdu)
+    // We'll assume ctx.input.srcLocalPath might be a single file or a folder.
     searchPath := ctx.input.srcLocalPath
-    if info, err := os.Stat(searchPath); err != nil {
-        hasListError = err
+    info, err := os.Stat(searchPath)
+    if err != nil {
+        listError = err
         return
-    } else if !info.IsDir() {
-        // srcLocalPath eğer direkt .zip dosyası ise
+    }
+    // If it's a file (single .zip), handle it directly
+    if !info.IsDir() {
         atomic.AddInt64(&totalCount, 1)
         newReq := ctx.input
         newReq.srcLocalPath = searchPath
@@ -112,21 +109,21 @@ func (c *unzipCommand) scanZipDirAndDoAction(ctx unzipScanCtx) (totalCount int64
         return
     }
 
-    // srcLocalPath bir klasörse:
-    errScan := filepath.Walk(searchPath, func(path string, info os.FileInfo, err error) error {
-        if err != nil {
-            hasListError = err
-            return err
+    // Otherwise, recursively walk the directory
+    err = filepath.Walk(searchPath, func(path string, f os.FileInfo, walkErr error) error {
+        if walkErr != nil {
+            listError = walkErr
+            return walkErr
         }
-        if info.IsDir() {
-            // eğer -recursive vb. parametre verilmemişse alt klasörlere girmeyi atla
+        if f.IsDir() {
+            // If not recursive, skip subdirectories
             if !c.recursive && path != searchPath {
                 return filepath.SkipDir
             }
             return nil
         }
-        // Sadece *.zip dosyaları
-        if strings.HasSuffix(strings.ToLower(info.Name()), ".zip") {
+        // We only care about files ending in .zip
+        if strings.HasSuffix(strings.ToLower(f.Name()), ".zip") {
             atomic.AddInt64(&totalCount, 1)
             newReq := ctx.input
             newReq.srcLocalPath = path
@@ -137,63 +134,57 @@ func (c *unzipCommand) scanZipDirAndDoAction(ctx unzipScanCtx) (totalCount int64
         return nil
     })
 
-    if errScan != nil && hasListError == nil {
-        hasListError = errScan
+    if err != nil && listError == nil {
+        listError = err
     }
     return
 }
 
-// Klasik: unzipCommand içinde unzip yapılacak fonksiyon
+// doUnzipFile coordinates the actual unzip operation for a single file
 func (c *unzipCommand) doUnzipFile(req unzipRequestInput, barCh progress.SingleBarChan, fastFailed error) int {
     if fastFailed != nil {
-        // Örnek "fast fail" durumu
-        doLog(LEVEL_ERROR, "fastFailed triggered: %s", fastFailed.Error())
+        doLog(LEVEL_ERROR, "Fast fail triggered: %s", fastFailed.Error())
         return 0
     }
-    // Normalde concurrency update, progress bar, vs.
     start := assist.GetUtcNow()
     err := c.localUnzipFile(req)
     cost := (assist.GetUtcNow().UnixNano() - start.UnixNano()) / 1000000
 
     if err != nil {
-        // Hata durumunu kaydet
-        doLog(LEVEL_ERROR, "Unzip failed. cost [%d ms], err [%s]", cost, err.Error())
+        doLog(LEVEL_ERROR, "Unzip failed. Duration [%d ms], Error [%s]", cost, err.Error())
         if barCh != nil {
-            barCh.SendError(1) // Örneğin bir hata bar’ı
+            barCh.SendError(1)
         }
         return 0
     }
 
-    // Eğer her şey yolunda ise, log, progress bar
-    doLog(LEVEL_INFO, "Unzip success. cost [%d ms]", cost)
+    doLog(LEVEL_INFO, "Unzip succeeded in [%d ms].", cost)
     if barCh != nil {
         barCh.Send(1)
     }
     return 1
 }
 
-// unzipCommand aksiyon: Tek zip veya -r parametresiyle klasör tarama
+// unzipDir handles either a single .zip file or all .zip files within a directory
+// using concurrency pools.
 func (c *unzipCommand) unzipDir(req unzipRequestInput) error {
-    // concurrency havuzu
     poolCacheCount := assist.StringToInt(config["defaultJobsCacheCount"], defaultJobsCacheCount)
     pool := concurrent.NewRoutinePool(c.jobs, poolCacheCount)
 
-    // progress bar
     barCh := newSingleBarChan()
     if c.force {
         barCh.Start()
     }
 
-    // Taramayı başlat
-    totalCount, hasListError := c.scanZipDirAndDoAction(unzipScanCtx{
+    totalCount, listErr := c.scanZipDirAndDoAction(unzipScanCtx{
         input:      req,
-        barCh:      barCh,
         pool:       pool,
+        barCh:      barCh,
         actionName: "unzip",
         action:     c.doUnzipFile,
     })
 
-    doLog(LEVEL_INFO, "Number of zip files to unzip: %d", totalCount)
+    doLog(LEVEL_INFO, "Number of zip files to process for unzip: %d", totalCount)
     progress.SetTotalCount(totalCount)
     barCh.SetTotalCount(totalCount)
 
@@ -201,12 +192,11 @@ func (c *unzipCommand) unzipDir(req unzipRequestInput) error {
         barCh.Start()
     }
 
-    // Havuzu kapat
     pool.ShutDown()
     barCh.WaitToFinished()
 
-    if hasListError != nil {
-        logError(hasListError, LEVEL_ERROR, fmt.Sprintf("List zip files failed: %v", hasListError))
+    if listErr != nil {
+        logError(listErr, LEVEL_ERROR, fmt.Sprintf("Listing zip files failed: %v", listErr))
         return assist.ErrUncompeleted
     }
     if progress.GetFailedCount() > 0 {
@@ -216,13 +206,14 @@ func (c *unzipCommand) unzipDir(req unzipRequestInput) error {
 }
 
 // ---------------------------------------------------------------------------
-// ------------------------- unzipCommand init / action / help ---------------
+// --------------------------- initUnzip Command ------------------------------
 
 func initUnzip() command {
     c := &unzipCommand{}
     c.key = "unzip"
-    c.usage = "unzip [local_path] [target_folder] [options...]"
-    c.description = "unzip local .zip files"
+    c.usage = "unzip <local_path> <destination_path> [options...]"
+    c.description = "unzip local .zip files into a specified directory"
+
     c.define = func() {
         c.init()
         c.defineBasic()
@@ -232,79 +223,70 @@ func initUnzip() command {
         c.flagSet.BoolVar(&c.flat, "flat", false, "")
         c.flagSet.IntVar(&c.jobs, "j", 1, "")
         c.flagSet.IntVar(&c.parallel, "p", 1, "")
-        // ... isterseniz ek parametreler
     }
 
     c.action = func() error {
         args := c.flagSet.Args()
         if len(args) < 2 {
             c.showHelp()
-            printf("Error: invalid args, please check help doc")
+            printf("Error: Invalid arguments. Refer to the help documentation.")
             return assist.ErrInvalidArgs
         }
 
-        // source: local .zip veya klasör, target: açılacak klasör
         srcPath := args[0]
         dstPath := args[1]
 
-        // Kontrol
         if srcPath == "" || dstPath == "" {
-            printf("Error: source and target paths cannot be empty")
+            printf("Error: Source and destination paths cannot be empty.")
             return assist.ErrInvalidArgs
         }
-        // concurrency param. check
+
+        // Concurrency checks
         if c.jobs > 10 {
-            printf("Error: The max jobs for unzip is 10")
+            printf("Error: The maximum number of jobs for unzip is 10.")
             return assist.ErrInvalidArgs
         }
         if c.parallel > 10 {
-            printf("Error: The max parallel for unzip is 10")
+            printf("Error: The maximum parallelism for unzip is 10.")
             return assist.ErrInvalidArgs
         }
 
-        // Log start
         c.printStart()
 
-        // unzipRequestInput hazırlığı
         unzipReq := unzipRequestInput{
             srcLocalPath:   srcPath,
             dstLocalPath:   dstPath,
-            needSubfolders: !c.flat,
-            canOverwrite:   c.force, // vb.
+            keepSubfolders: !c.flat,
+            canOverwrite:   c.force,
         }
 
-        // Varsayalım -r parametresi yoksa sadece tek bir zip dosyası
+        // If not recursive, handle single .zip file
         if !c.recursive {
-            // Tek zip
             info, err := os.Stat(srcPath)
             if err != nil {
                 printError(err)
                 return assist.ErrInvalidArgs
             }
             if info.IsDir() {
-                printf("Error: Must pass -r to unzip a folder containing multiple zip files!")
+                printf("Error: -r must be specified to process multiple zips from a folder.")
                 return assist.ErrInvalidArgs
             }
-
-            // Tek dosya için “dryRun” / “unzipFile” vs.
             if c.dryRun {
-                printf("Unzip dry run done, source: %s => target: %s", srcPath, dstPath)
+                printf("Unzip dry run: source: %s -> destination: %s", srcPath, dstPath)
                 return nil
             }
-            // Asıl unzip
+            // Actual single-file unzip
             err = c.localUnzipFile(unzipReq)
             if err != nil {
-                logError(err, LEVEL_ERROR, fmt.Sprintf("Unzip %s => %s failed", srcPath, dstPath))
+                logError(err, LEVEL_ERROR, fmt.Sprintf("Unzip failed: %s -> %s", srcPath, dstPath))
                 return assist.ErrExecuting
             }
-            // success
-            printf("Unzip successfully, %s => %s", srcPath, dstPath)
+            printf("Unzip succeeded: %s -> %s", srcPath, dstPath)
             return nil
         }
 
-        // -r ise, klasördeki tüm .zip dosyalarını bulup açmak
-        err := c.unzipDir(unzipReq)
-        if err != nil {
+        // If -r is set, we handle all .zip files under srcPath
+        if err := c.unzipDir(unzipReq); err != nil {
             return err
         }
         return nil
@@ -313,36 +295,38 @@ func initUnzip() command {
     c.help = func() {
         p := i18n.GetCurrentPrinter()
         p.Printf("Summary:")
-        printf("%2s%s", "", p.Sprintf("unzip local .zip files/folders"))
+        printf("%2s%s", "", p.Sprintf("Unzip local .zip files/folders"))
         printf("")
         p.Printf("Syntax 1:")
-        printf("%2s%s", "", "obsutil unzip local_folder_or_zip target_folder [-r] [-dryRun] [-f] [-flat] [-j=1] [-p=1] [-config=xxx] ..."+commandCommonSyntax()+commandRequestPayerSyntax())
+        printf("%2s%s", "",
+            "obsutil unzip <local_path_or_zip> <destination_path> [-r] [-dryRun] [-f] [-flat] [-j=1] [-p=1] [-config=xxx]" +
+            commandCommonSyntax() + commandRequestPayerSyntax())
         printf("")
+
         p.Printf("Options:")
         printf("%2s%s", "", "-r")
-        printf("%4s%s", "", p.Sprintf("recursively unzip all .zip files inside a local folder"))
+        printf("%4s%s", "", p.Sprintf("Recursively unzip all .zip files found in a local folder"))
         printf("")
         printf("%2s%s", "", "-f")
-        printf("%4s%s", "", p.Sprintf("force mode, overwrites existing files without asking"))
+        printf("%4s%s", "", p.Sprintf("Force mode: overwrite files without prompting"))
         printf("")
         printf("%2s%s", "", "-dryRun")
-        printf("%4s%s", "", p.Sprintf("simulate the unzip process without extracting"))
+        printf("%4s%s", "", p.Sprintf("Simulate the unzip process without extracting any files"))
         printf("")
         printf("%2s%s", "", "-flat")
-        printf("%4s%s", "", p.Sprintf("unzip files into target directory without creating subfolders"))
+        printf("%4s%s", "", p.Sprintf("Unzip files directly into the target directory without preserving folder structure"))
         printf("")
         printf("%2s%s", "", "-j=1")
-        printf("%4s%s", "", p.Sprintf("the maximum number of listing jobs"))
+        printf("%4s%s", "", p.Sprintf("Maximum number of listing jobs for the unzip process (default can be from config)"))
         printf("")
         printf("%2s%s", "", "-p=1")
-        printf("%4s%s", "", p.Sprintf("the maximum number of concurrent unzip tasks"))
+        printf("%4s%s", "", p.Sprintf("Maximum number of concurrent unzip tasks (default can be from config)"))
         printf("")
         printf("%2s%s", "", "-config=xxx")
-        printf("%4s%s", "", p.Sprintf("the path to the custom config file when running this command"))
+        printf("%4s%s", "", p.Sprintf("Custom config file path for the command"))
         printf("")
         commandCommonHelp(p)
         commandRequestPayerHelp(p)
     }
-
     return c
 }
